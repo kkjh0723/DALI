@@ -113,6 +113,10 @@ class DLL_PUBLIC Executor : public ExecutorBase, public WorkspacePolicy, public 
   DLL_PUBLIC void ReleaseOutputs() override;
   DLL_PUBLIC void SetCompletionCallback(ExecutorCallback cb) override;
 
+  DLL_PUBLIC void ShutdownQueue() {
+    QueuePolicy::SignalStop();
+  }
+
   DISABLE_COPY_MOVE_ASSIGN(Executor);
 
  protected:
@@ -261,7 +265,7 @@ void Executor<WorkspacePolicy, QueuePolicy>::RunCPU() {
   TimeRange tr("[Executor] RunCPU");
 
   auto support_idx = QueuePolicy::AcquireIdxs(OpType::SUPPORT);
-  if (exec_error_ || QueuePolicy::IsErrorSignaled()) {
+  if (exec_error_ || QueuePolicy::IsStopSignaled() || !QueuePolicy::AreValid(support_idx)) {
     QueuePolicy::ReleaseIdxs(OpType::SUPPORT, support_idx);
     return;
   }
@@ -282,7 +286,7 @@ void Executor<WorkspacePolicy, QueuePolicy>::RunCPU() {
     }
   } catch (std::runtime_error &e) {
     exec_error_ = true;
-    QueuePolicy::SignalError();
+    QueuePolicy::SignalStop();
     std::lock_guard<std::mutex> errors_lock(errors_mutex_);
     errors_.push_back(e.what());
     // Let the ReleaseIdx chain wake the output cv
@@ -291,22 +295,21 @@ void Executor<WorkspacePolicy, QueuePolicy>::RunCPU() {
   QueuePolicy::ReleaseIdxs(OpType::SUPPORT, support_idx);
 
   auto cpu_idx = QueuePolicy::AcquireIdxs(OpType::CPU);
-  if (exec_error_ || QueuePolicy::IsErrorSignaled()) {
+  if (exec_error_ || QueuePolicy::IsStopSignaled() || !QueuePolicy::AreValid(cpu_idx)) {
     QueuePolicy::ReleaseIdxs(OpType::CPU, cpu_idx);
     return;
   }
-  auto queue_idx = cpu_idx;
 
   // Run the cpu-ops in the thread pool
   for (int i = 0; i < batch_size_; ++i) {
     thread_pool_.DoWorkWithID(std::bind(
-          [this, queue_idx] (int data_idx, int tid) {
+          [this, cpu_idx] (int data_idx, int tid) {
           TimeRange tr("[Executor] RunCPU on " + to_string(data_idx));
           SampleWorkspace ws;
           for (int j = 0; j < graph_->NumOp(OpType::CPU); ++j) {
             OpNode &op_node = graph_->Node(OpType::CPU, j);
             OperatorBase &op = *op_node.op;
-            WorkspacePolicy::template GetWorkspace<OpType::CPU>(queue_idx, *graph_, op_node)
+            WorkspacePolicy::template GetWorkspace<OpType::CPU>(cpu_idx, *graph_, op_node)
                 .GetSample(&ws, data_idx, tid);
             TimeRange tr("[Executor] Run CPU op " + op_node.instance_name
                 + " on " + to_string(data_idx),
@@ -319,7 +322,7 @@ void Executor<WorkspacePolicy, QueuePolicy>::RunCPU() {
     thread_pool_.WaitForWork();
   } catch (std::runtime_error& e) {
     exec_error_ = true;
-    QueuePolicy::SignalError();
+    QueuePolicy::SignalStop();
     std::lock_guard<std::mutex> errors_lock(errors_mutex_);
     errors_.push_back(e.what());
     // Let the ReleaseIdx chain wake the output cv
@@ -334,18 +337,17 @@ void Executor<WorkspacePolicy, QueuePolicy>::RunMixed() {
   DeviceGuard g(device_id_);
 
   auto mixed_idx = QueuePolicy::AcquireIdxs(OpType::MIXED);
-  if (exec_error_ || QueuePolicy::IsErrorSignaled()) {
+  if (exec_error_ || QueuePolicy::IsStopSignaled() || !QueuePolicy::AreValid(mixed_idx)) {
     QueuePolicy::ReleaseIdxs(OpType::MIXED, mixed_idx);
     return;
   }
-  auto queue_idx = mixed_idx;
 
   try {
     for (int i = 0; i < graph_->NumOp(OpType::MIXED); ++i) {
       OpNode &op_node = graph_->Node(OpType::MIXED, i);
       OperatorBase &op = *op_node.op;
       typename WorkspacePolicy::template ws_t<OpType::MIXED> ws =
-          WorkspacePolicy::template GetWorkspace<OpType::MIXED>(queue_idx, *graph_, i);
+          WorkspacePolicy::template GetWorkspace<OpType::MIXED>(mixed_idx, *graph_, i);
       TimeRange tr("[Executor] Run Mixed op " + op_node.instance_name,
           TimeRange::kOrange);
       op.Run(&ws);
@@ -355,14 +357,14 @@ void Executor<WorkspacePolicy, QueuePolicy>::RunMixed() {
     }
   } catch (std::runtime_error &e) {
     exec_error_ = true;
-    QueuePolicy::SignalError();
+    QueuePolicy::SignalStop();
     std::lock_guard<std::mutex> errors_lock(errors_mutex_);
     errors_.push_back(e.what());
     // Let the ReleaseIdx chain wake the output cv
   }
 
   // Pass the work to the gpu stage
-  QueuePolicy::ReleaseIdxs(OpType::MIXED, mixed_idx);
+  QueuePolicy::ReleaseIdxs(OpType::MIXED, mixed_idx, mixed_op_stream_);
 }
 
 template <typename WorkspacePolicy, typename QueuePolicy>
@@ -370,11 +372,10 @@ void Executor<WorkspacePolicy, QueuePolicy>::RunGPU() {
   TimeRange tr("[Executor] RunGPU");
 
   auto gpu_idx = QueuePolicy::AcquireIdxs(OpType::GPU);
-  if (exec_error_ || QueuePolicy::IsErrorSignaled()) {
+  if (exec_error_ || QueuePolicy::IsStopSignaled() || !QueuePolicy::AreValid(gpu_idx)) {
     QueuePolicy::ReleaseIdxs(OpType::GPU, gpu_idx);
     return;
   }
-  auto queue_idx = gpu_idx;
   DeviceGuard g(device_id_);
 
   // Enforce our assumed dependency between consecutive
@@ -392,7 +393,7 @@ void Executor<WorkspacePolicy, QueuePolicy>::RunGPU() {
       OpNode &op_node = graph_->Node(OpType::GPU, i);
       OperatorBase &op = *op_node.op;
       typename WorkspacePolicy::template ws_t<OpType::GPU> ws =
-          WorkspacePolicy::template GetWorkspace<OpType::GPU>(queue_idx, *graph_, i);
+          WorkspacePolicy::template GetWorkspace<OpType::GPU>(gpu_idx, *graph_, i);
       auto parent_events = ws.ParentEvents();
 
       for (auto &event : parent_events) {
@@ -414,14 +415,14 @@ void Executor<WorkspacePolicy, QueuePolicy>::RunGPU() {
       int src_idx = graph_->NodeIdx(src_id);
 
       // Record events for each output requested by the user
-      cudaEvent_t event = gpu_output_events_[i].GetEvent(queue_idx[OpType::GPU]);
+      cudaEvent_t event = gpu_output_events_[i].GetEvent(gpu_idx[OpType::GPU]);
       if (graph_->NodeType(src_id) == OpType::MIXED) {
         typename WorkspacePolicy::template ws_t<OpType::MIXED> ws =
-            WorkspacePolicy::template GetWorkspace<OpType::MIXED>(queue_idx, *graph_, src_idx);
+            WorkspacePolicy::template GetWorkspace<OpType::MIXED>(gpu_idx, *graph_, src_idx);
         CUDA_CALL(cudaEventRecord(event, ws.stream()));
       } else if (graph_->NodeType(src_id) == OpType::GPU) {
         typename WorkspacePolicy::template ws_t<OpType::GPU> ws =
-            WorkspacePolicy::template GetWorkspace<OpType::GPU>(queue_idx, *graph_, src_idx);
+            WorkspacePolicy::template GetWorkspace<OpType::GPU>(gpu_idx, *graph_, src_idx);
         CUDA_CALL(cudaEventRecord(event, ws.stream()));
       } else {
         DALI_FAIL("Internal error. Output node is not gpu/mixed");
@@ -429,23 +430,23 @@ void Executor<WorkspacePolicy, QueuePolicy>::RunGPU() {
     }
   } catch (std::runtime_error &e) {
     exec_error_ = true;
-    QueuePolicy::SignalError();
+    QueuePolicy::SignalStop();
     std::lock_guard<std::mutex> errors_lock(errors_mutex_);
     errors_.push_back(e.what());
     // Let the ReleaseIdx chain wake the output cv
   }
   // Update the ready queue to signal that all the work
-  // in the `queue_idx` set of output buffers has been
+  // in the `gpu_idx` set of output buffers has been
   // issued. Notify any waiting threads.
 
 
   // We do not release, but handle to used outputs
-  QueuePolicy::QueueOutputIdxs(gpu_idx);
+  QueuePolicy::QueueOutputIdxs(gpu_idx, gpu_op_stream_);
 
-  // Save the queue_idx so we can enforce the
+  // Save the gpu_idx so we can enforce the
   // dependency between consecutive iterations
   // of the gpu stage of the pipeline.
-  previous_gpu_queue_idx_ = queue_idx[OpType::GPU];
+  previous_gpu_queue_idx_ = gpu_idx[OpType::GPU];
 
   // call any registered previously callback
   if (callback_) {
@@ -470,7 +471,7 @@ void Executor<WorkspacePolicy, QueuePolicy>::ShareOutputs(DeviceWorkspace *ws) {
   DeviceGuard g(device_id_);
   ws->Clear();
 
-  if (exec_error_ || QueuePolicy::IsErrorSignaled()) {
+  if (exec_error_ || QueuePolicy::IsStopSignaled()) {
     std::lock_guard<std::mutex> errors_lock(errors_mutex_);
     std::string error = errors_.empty() ? "Unknown error" : errors_.front();
     throw std::runtime_error(error);
@@ -478,7 +479,7 @@ void Executor<WorkspacePolicy, QueuePolicy>::ShareOutputs(DeviceWorkspace *ws) {
 
   auto output_idx = QueuePolicy::UseOutputIdxs();
 
-  if (exec_error_ || QueuePolicy::IsErrorSignaled()) {
+  if (exec_error_ || QueuePolicy::IsStopSignaled()) {
     std::lock_guard<std::mutex> errors_lock(errors_mutex_);
     std::string error = errors_.empty() ? "Unknown error" : errors_.front();
     throw std::runtime_error(error);
